@@ -1,0 +1,39 @@
+CREATE QUERY all_path_given_hop(VERTEX source, INT max_hop) FOR GRAPH fraud {   
+	  ListAccum<ListAccum<VERTEX>> @old_paths;
+	  ListAccum<ListAccum<VERTEX>> @new_paths;
+	  MapAccum<INT, INT> @@result;
+	  SetAccum<VERTEX> @@fraud;
+	
+	  Start = {source};
+	  Start = SELECT s
+	          FROM Start:s
+	          ACCUM s.@old_paths = [[s]];
+	
+		WHILE true LIMIT max_hop DO
+	      Start = SELECT t
+	              FROM Start:s -(Link:e) -> :t 
+                ACCUM 
+	                  FOREACH path in s.@old_paths DO
+	                      IF NOT path.contains(t) THEN
+	                          t.@new_paths += path + [t]  # add t only when it's not in the path
+	                      END
+	                  END
+	              POST-ACCUM t.@old_paths = t.@new_paths, # move new_paths to old_paths 
+	                         t.@new_paths.clear(),
+	                         IF t.is_fraud == TRUE THEN  
+	                             @@fraud += t
+	                         END
+	              HAVING t.@old_paths.size() > 0;
+	      V = {@@fraud};
+	      V = SELECT s 
+	          FROM V:s
+	          ACCUM 
+	              FOREACH path in s.@old_paths DO
+	                  @@result += (path.size()-1 -> 1)
+	              END;
+	  END;
+	
+	  V = {@@fraud};
+    print @@result;	
+	  print V.@old_paths;
+}
