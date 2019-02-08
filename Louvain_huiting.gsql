@@ -1,0 +1,214 @@
+CREATE QUERY Louvain_huiting(INT iter1, INT iter2, INT debug, INT distribution = 0) FOR GRAPH social {
+# Louvain Modularity Method for Community Detection
+
+        # map: <cluster ID, value>
+              TYPEDEF TUPLE <INT csize, INT number> CLUSTER_NUM;
+        MapAccum<INT, FLOAT> @@totIncidentCluster;   # sun of weight incident to clusters
+     MapAccum<INT, FLOAT> @@selfLoop;
+        MapAccum<INT, INT> @@clusterSizes;                # size of a cluster
+        MapAccum<INT, FLOAT> @weightToCluster;  # weight from one vertex incident to that cluster
+        SumAccum<FLOAT> @@totalWeight;   # total weight of all edges
+        SumAccum<FLOAT> @weight;          # total weight incident to this vertex
+              SumAccum<FLOAT> @cweight;       # total weight incident to this aggregate vertex
+     SumAccum<INT> @uid;        # which vertex it belongs to
+        SumAccum<INT> @cid;        # which cluster it belongs to
+     SumAccum<INT> @vid;        # internal id
+        SumAccum<FLOAT> @deltaQ;         # contribution to the modularity
+        OrAccum @@changed;               # true if cluster membership changed in this iterator
+        SumAccum<FLOAT> @@modularity;
+           SumAccum<FLOAT> @@modularity2;
+     MapAccum<INT, MapAccum<INT, FLOAT>> @@weightToClusterMap;   # calculate edges between communities
+     MapAccum<INT, SetAccum<INT>> @@moveComm; // map of communities that changed its community id
+           MapAccum<INT, MinAccum<VERTEX>> @@representMap;
+           SetAccum<VERTEX> @@representSet;
+     FLOAT last_modularity = 0;
+           FLOAT last_modularity2 = 0;
+     INT iteration;
+     FLOAT epsilon = 0.0000001;
+     INT iteration2;
+     HeapAccum<CLUSTER_NUM>(100, csize ASC) @@cluster_dist;
+     MapAccum<INT, INT> @@cluster_Map;
+     MapAccum<INT, ListAccum<INT>> @@cluster_members;
+
+
+# Initialize: count edges and set a unique cluster ID for each vertex
+
+             // do sth especially for the 1st step.
+
+
+
+
+
+              Start = {ANY};
+
+        S = SELECT s
+                FROM Start:s -(Friend:e)-> :t
+                ACCUM @@totalWeight += e.weight,
+                      s.@weight += e.weight
+                POST-ACCUM s.@vid = getvid(s),
+                           s.@uid = s.@vid,
+                           s.@cid = s.@vid,  # Label each vertex with its own internal ID
+                                 @@totIncidentCluster += (s.@cid -> s.@weight);  # every vertex is a cluster here, so it's the same as s.@weight
+
+# For each vertex, calculate the change in modularity FROM adding it to each of the nearby clusters
+# Add vertex to cluster with highest positive change in modularity
+# Repeat the above until no vertices change cluster anymore
+        WHILE (iteration < 2 OR @@modularity - last_modularity > epsilon) LIMIT iter1 DO
+                        iteration += 1;
+                S     = SELECT s
+                        FROM Start:s -(Friend:e)-> :t
+                              //WHERE s.@cid != t.@cid  // since the default resultCluster is itself, don't need to calculate itself
+                        ACCUM s.@weightToCluster += (t.@cid -> e.weight)
+                        POST-ACCUM
+                                INT resultCluster = s.@cid,
+                                FLOAT maxDeltaQ = 0.0,
+                                FLOAT deltaQ_new = 0.0,
+                                FOREACH (cluster, weightToC) IN s.@weightToCluster DO
+                                        FLOAT incident = @@totIncidentCluster.get(cluster),
+                                        deltaQ_new = weightToC - 2 * incident * s.@weight/ @@totalWeight,
+                                        IF deltaQ_new > maxDeltaQ THEN
+                                                maxDeltaQ = deltaQ_new,
+                                                resultCluster = cluster
+                                        END
+                                END,
+                                IF s.@cid != resultCluster THEN
+                                        @@totIncidentCluster += (s.@cid -> (-1 * s.@weight)),
+                                        @@totIncidentCluster += (resultCluster -> s.@weight),
+                                        s.@cid = resultCluster
+                                END,
+                                s.@weightToCluster.clear()
+                        ;
+                //@@totIncidentCluster.clear();
+             //IF @@totIncidentCluster.get(s.@cid) == s.@weight
+             last_modularity = @@modularity;
+             T1 = SELECT s
+                     FROM Start:s-(:e)-:t
+                     WHERE s.@cid == t.@cid
+                     ACCUM @@modularity += e.weight - s.@weight * t.@weight / (@@totalWeight);
+                @@modularity = @@modularity / @@totalWeight;
+                PRINT iteration AS Phase1Iter, @@modularity;
+                      log(debug > 0, "[redrain]#1", iteration, @@modularity);
+        END;
+
+
+# phase 2
+# merge
+     iteration = 0;
+     WHILE (iteration < 2 OR @@modularity2 - last_modularity2 > epsilon) LIMIT iter2 DO
+            iteration += 1;
+                  Start = SELECT s
+                    FROM Start:s -(Friend:e)-> :t
+                    ACCUM s.@uid = s.@cid;   // coarsen graph, don't need to change if isolated
+
+
+          # Select the vertices to represent the coarsened graph
+            Start = SELECT s
+                    FROM Start:s
+                          ACCUM @@representMap += (s.@cid -> s);
+                  FOREACH (key, value) IN @@representMap DO
+                    @@representSet += value;
+                  END;
+                                    represent = {@@representSet};
+            @@representMap.clear();
+                  @@representSet.clear();
+
+          log(debug > 0, "[redrain]#2_2", represent.size()); //@@clusterSizes.size());
+
+             # Add self-loop to totalIncident
+                S = SELECT s
+                  FROM Start:s -(Friend:e)-> :t
+                        WHERE s.@uid == t.@uid
+                  ACCUM @@totIncidentCluster += (s.@uid -> e.weight);
+             # Get @weight from totalIncident
+                represent = SELECT s
+                            FROM represent:s
+                            ACCUM s.@cweight = @@totIncidentCluster.get(s.@uid);
+       # Calculate weight incident from vertex to cluster in coarsened graph
+          @@weightToClusterMap.clear();
+          S = SELECT s
+              FROM Start:s -(:e)-:t
+              WHERE s.@cid != t.@cid //AND @@totIncidentCluster.get(s.@uid) > 0 AND @@totIncidentCluster.get(t.@uid) > 0   //@@totIncidentCluster keeps changing, can be 0
+              ACCUM @@weightToClusterMap += (s.@uid -> (t.@cid -> e.weight));  // from s, incident to some clusters. Not consider the same cluster
+
+
+          log(debug > 1, "[redrain]#2_2", @@weightToClusterMap.size());
+          iteration2 = 0;
+             last_modularity = 0;
+             @@modularity = 0;
+       WHILE (iteration2 < 2 OR @@modularity - last_modularity > epsilon) limit iter1 DO
+           iteration2 += 1;
+                        S = SELECT s
+                        FROM represent:s
+                        POST-ACCUM
+                                INT resultCluster = s.@cid,
+                                FLOAT maxDeltaQ = 0.0,
+                                FLOAT deltaQ_new = 0.0,
+                                FOREACH (cluster, weightToC) IN @@weightToClusterMap.get(s.@uid) DO
+                                        FLOAT incident = @@totIncidentCluster.get(cluster),
+                                        deltaQ_new = weightToC - 2 * incident * s.@cweight/ @@totalWeight, //total weight should be the same
+                                        IF deltaQ_new > maxDeltaQ THEN
+                                                maxDeltaQ = deltaQ_new,
+                                                resultCluster = cluster
+                                        END
+                                END,
+                                IF s.@cid != resultCluster THEN
+                                     @@totIncidentCluster += (s.@cid -> (-1 * s.@cweight)),
+                                        @@totIncidentCluster += (resultCluster -> s.@cweight),
+                                        @@moveComm += (s.@uid -> resultCluster),
+                                        s.@cid = resultCluster
+                                END,
+                                                                s.@weightToCluster.clear()
+                        ;
+
+             log(debug > 1, "[redrain]#2_1:", @@moveComm.size());
+                // move nodes
+                S = SELECT s
+                     FROM Start:s
+                     WHERE @@moveComm.containsKey(s.@uid)
+                     POST-ACCUM FOREACH v IN @@moveComm.get(s.@uid) DO
+                                    s.@cid = v
+                                END;
+                @@moveComm.clear();
+
+             last_modularity = @@modularity;
+             S = SELECT s
+                     FROM Start:s-(:e)-:t
+                     WHERE s.@cid == t.@cid
+                     ACCUM @@modularity += e.weight - s.@weight * t.@weight / (@@totalWeight);
+                @@modularity = @@modularity / @@totalWeight;
+                PRINT @@modularity;
+                   log(debug > 0, "[redrain]#2_1", iteration2, @@modularity);
+        END;
+
+              last_modularity2 = @@modularity2;
+             S = SELECT s
+                     FROM Start:s-(:e)-:t
+                     WHERE s.@cid == t.@cid
+                     ACCUM @@modularity2 += e.weight - s.@weight * t.@weight / (@@totalWeight);
+                @@modularity2 = @@modularity2 / @@totalWeight;
+                PRINT @@modularity2;
+                   log(debug > 0, "[redrain]#2_2", iteration, @@modularity2);
+
+END;
+
+
+        Start = {ANY};
+        Start = SELECT s FROM Start:s
+                POST-ACCUM s.cid = s.@cid,
+                        @@clusterSizes += (s.@cid -> 1);
+
+            IF distribution ==0 THEN
+                   FOREACH (cluster, csize) IN @@compSizes DO
+                       @@cluster_Map += (csize -> 1);
+                   END;
+                   FOREACH (csize, number) IN @@cluster_Map DO
+                       @@cluster_dist += CLUSTER_NUM(csize, number);
+                   END;
+                   PRINT @@cluster_dist;
+            ELSE
+                   FOREACH (cluster, csize) IN @@compSizes DO
+                       @@cluster_members += (csize -> cluster);
+                   END;
+                   PRINT @@cluster_members;
+            END;
+}
