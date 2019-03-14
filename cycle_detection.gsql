@@ -1,4 +1,6 @@
 CREATE QUERY cycle_detection() FOR GRAPH social { 
+# https://en.wikipedia.org/wiki/Rocha%E2%80%93Thatte_cycle_detection_algorithm
+
 	TYPEDEF TUPLE <VERTEX personV, INT uid> p;
   ListAccum<ListAccum<p>> @currList, @newList, @@cycles;
 	OrAccum @deactivate;
